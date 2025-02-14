@@ -98,7 +98,7 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
                     image_only_indicator,
                 )
             elif isinstance(module, SpatialTransformer):
-                x = layer(x, context)
+                x = layer(x, context[0] if isinstance(context, tuple) else context)
             else:
                 x = layer(x)
         return x

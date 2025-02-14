@@ -28,7 +28,7 @@ class OpenAIWrapper(IdentityWrapper):
         return self.diffusion_model(
             x,
             timesteps=t,
-            context=c.get("crossattn", None),
+            context=(c.get("crossattn", None), c.get("ref", None)),
             y=c.get("vector", None),
             **kwargs,
         )

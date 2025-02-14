@@ -111,7 +111,7 @@ class EDMSampler(SingleStepDiffusionSampler):
             x, cond, uc, num_steps
         )
 
-        for i in self.get_sigma_gen(num_sigmas):
+        for i in tqdm(self.get_sigma_gen(num_sigmas), dynamic_ncols=True):
             gamma = (
                 min(self.s_churn / (num_sigmas - 1), 2**0.5 - 1)
                 if self.s_tmin <= sigmas[i] <= self.s_tmax

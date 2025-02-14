@@ -551,16 +551,44 @@ class BasicTransformerBlock(nn.Module):
     def _forward(
         self, x, context=None, additional_tokens=None, n_times_crossframe_attn_in_self=0
     ):
+        is_ref = True
+        if isinstance(context, tuple):
+            context, x_ref = context
+            assert len(x_ref) >= 1
+            flags = x_ref[0]
+            is_ref = flags["is_ref"]
+            strength = flags["strength"]
+            assert 0 <= strength <= 1
+            ema = flags["ema"]
+            index = flags["index"]
+            if is_ref:
+                x_ref.append(x.cpu())
+            else:
+                # x_ref_current = x_ref.pop(1)
+                x_ref_current = x_ref[index + 1]
+                if x_ref_current is not None:
+                    x_ref_current = x_ref_current.to(x)
+                    assert x_ref_current.shape == x.shape
+            flags["index"] = index + 1
+        if is_ref or x_ref_current is None:
+            context_new = None
+        else:
+            context_new = x_ref_current * strength + x * (1 - strength)
+            if ema:
+                x_ref[index + 1] = context_new.cpu()
+
         x = (
             self.attn1(
                 self.norm1(x),
-                context=context if self.disable_self_attn else None,
+                # context=context if self.disable_self_attn else None,
+                context=context if self.disable_self_attn else (None if context_new is None else self.norm1(context_new)),
                 additional_tokens=additional_tokens,
                 n_times_crossframe_attn_in_self=n_times_crossframe_attn_in_self
                 if not self.disable_self_attn
                 else 0,
             )
             + x
+            # + (x if context_new is None else context_new)
         )
         x = (
             self.attn2(

@@ -19,24 +19,34 @@ from scripts.util.detection.nsfw_and_watermark_dectection import DeepFloydDataFi
 from sgm.inference.helpers import embed_watermark
 from sgm.util import default, instantiate_from_config
 from torchvision.transforms import ToTensor
+import sgm
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.checkpoint")
 
 
 def sample(
     input_path: str = "assets/test_image.png",  # Can either be image file or folder with image files
     num_frames: Optional[int] = None,  # 21 for SV3D
     num_steps: Optional[int] = None,
-    version: str = "svd",
+    version: str = "sv3d_p",
     fps_id: int = 6,
     motion_bucket_id: int = 127,
     cond_aug: float = 0.02,
     seed: int = 23,
-    decoding_t: int = 14,  # Number of frames decoded at a time! This eats most VRAM. Reduce if necessary.
+    decoding_t: int = 1,  # Number of frames decoded at a time! This eats most VRAM. Reduce if necessary.
     device: str = "cuda",
     output_folder: Optional[str] = None,
-    elevations_deg: Optional[float | List[float]] = 10.0,  # For SV3D
+    elevations_deg: Optional[float | List[float]] = 0.0,  # For SV3D
     azimuths_deg: Optional[List[float]] = None,  # For SV3D
     image_frame_ratio: Optional[float] = None,
     verbose: Optional[bool] = False,
+    output_name: Optional[str] = None,
+    keep_bg: Optional[bool] = False,
+    resize: Optional[bool] = False,
+    ref: Optional[bool] = False,
+    ref_path: Optional[str] = None,
+    ref_strength: Optional[float] = 0.5,
+    ref_ema: Optional[bool] = False,
 ):
     """
     Simple script to generate a single sample conditioned on an image `input_path` or multiple images, one for each
@@ -85,13 +95,17 @@ def sample(
             len(elevations_deg) == num_frames
         ), f"Please provide 1 value, or a list of {num_frames} values for elevations_deg! Given {len(elevations_deg)}"
         polars_rad = [np.deg2rad(90 - e) for e in elevations_deg]
+        print("elevations: ", elevations_deg)
         if azimuths_deg is None:
             azimuths_deg = np.linspace(0, 360, num_frames + 1)[1:] % 360
         assert (
             len(azimuths_deg) == num_frames
         ), f"Please provide a list of {num_frames} values for azimuths_deg! Given {len(azimuths_deg)}"
         azimuths_rad = [np.deg2rad((a - azimuths_deg[-1]) % 360) for a in azimuths_deg]
-        azimuths_rad[:-1].sort()
+        # azimuths_rad[:-1].sort()
+        azimuths_rad = sorted(azimuths_rad[:-1]) + [azimuths_rad[-1]]
+        print("azimuths_deg: ", azimuths_deg)
+        print("azimuths_rad: ", azimuths_rad)
     else:
         raise ValueError(f"Version {version} does not exist.")
 
@@ -102,6 +116,7 @@ def sample(
         num_steps,
         verbose,
     )
+    model: sgm.models.diffusion.DiffusionEngine
     torch.manual_seed(seed)
 
     path = Path(input_path)
@@ -122,9 +137,20 @@ def sample(
         if len(all_img_paths) == 0:
             raise ValueError("Folder does not contain any images.")
     else:
-        raise ValueError
+        raise ValueError(path)
 
+    x_ref: "list[torch.Tensor]" = [{"is_ref": True, "strength": ref_strength, "ema": ref_ema, "index": 0}]  # flags
+    if ref:
+        assert "sv3d" in version
+        # ref_path = os.path.join(os.path.dirname(all_img_paths[0]), "..", "ref.pth")
+        if ref_path is not None:
+            if os.path.isfile(ref_path):
+                x_ref = torch.load(ref_path)
+                print(f"Loaded reference from {ref_path}.")
+            else:
+                print(f"Reference not found at {ref_path}, will save it on the first run.")
     for input_img_path in all_img_paths:
+        print(f"Input image: {input_img_path}")
         if "sv3d" in version:
             image = Image.open(input_img_path)
             if image.mode == "RGBA":
@@ -132,39 +158,59 @@ def sample(
             else:
                 # remove bg
                 image.thumbnail([768, 768], Image.Resampling.LANCZOS)
-                image = remove(image.convert("RGBA"), alpha_matting=True)
+                if not keep_bg:
+                    image = remove(image.convert("RGBA"), alpha_matting=True)
 
-            # resize object in frame
-            image_arr = np.array(image)
-            in_w, in_h = image_arr.shape[:2]
-            ret, mask = cv2.threshold(
-                np.array(image.split()[-1]), 0, 255, cv2.THRESH_BINARY
-            )
-            x, y, w, h = cv2.boundingRect(mask)
-            max_size = max(w, h)
-            side_len = (
-                int(max_size / image_frame_ratio)
-                if image_frame_ratio is not None
-                else in_w
-            )
-            padded_image = np.zeros((side_len, side_len, 4), dtype=np.uint8)
-            center = side_len // 2
-            padded_image[
-                center - h // 2 : center - h // 2 + h,
-                center - w // 2 : center - w // 2 + w,
-            ] = image_arr[y : y + h, x : x + w]
-            # resize frame to 576x576
-            rgba = Image.fromarray(padded_image).resize((576, 576), Image.LANCZOS)
-            # white bg
-            rgba_arr = np.array(rgba) / 255.0
-            rgb = rgba_arr[..., :3] * rgba_arr[..., -1:] + (1 - rgba_arr[..., -1:])
-            input_image = Image.fromarray((rgb * 255).astype(np.uint8))
+            if keep_bg:
+                image = image.convert("RGBA")
+                background = Image.new('RGBA', image.size, (255, 255, 255))  # white bg
+                # background = Image.new('RGBA', image.size, (0, 0, 0))
+                image = Image.alpha_composite(background, image)
+                input_image = image.convert("RGB").resize((576, 576), Image.LANCZOS)
+            else:
+                # resize object in frame
+                image_arr = np.array(image)
+                in_w, in_h = image_arr.shape[:2]
+                ret, mask = cv2.threshold(
+                    np.array(image.split()[-1]), 0, 255, cv2.THRESH_BINARY
+                )
+                mask[:] = 1
+                x, y, w, h = cv2.boundingRect(mask)
+                max_size = max(w, h)
+                side_len = (
+                    int(max_size / image_frame_ratio)
+                    if image_frame_ratio is not None
+                    else in_w
+                )
+                padded_image = np.zeros((side_len, side_len, 4), dtype=np.uint8)
+                center = side_len // 2
+                padded_image[
+                    center - h // 2 : center - h // 2 + h,
+                    center - w // 2 : center - w // 2 + w,
+                ] = image_arr[y : y + h, x : x + w]
+                # resize frame to 576x576
+                rgba = Image.fromarray(padded_image).resize((576, 576), Image.LANCZOS)
+                # white bg
+                rgba_arr = np.array(rgba) / 255.0
+                rgb = rgba_arr[..., :3] * rgba_arr[..., -1:] + (1 - rgba_arr[..., -1:])
+                input_image = Image.fromarray((rgb * 255).astype(np.uint8))
 
         else:
             with Image.open(input_img_path) as image:
+                # if not keep_bg:
+                #     image = remove(image)
+                if image.mode == "P":
+                    image = image.convert("RGBA")
                 if image.mode == "RGBA":
+                    # input_image = image.convert("RGB")
+                    input_image = Image.new("RGBA", image.size, "WHITE")
+                    input_image.paste(image, mask=image)
+                    input_image = input_image.convert("RGB")
+                else:
                     input_image = image.convert("RGB")
-                w, h = image.size
+                if resize:
+                    input_image = input_image.resize((576, 576), Image.LANCZOS)
+                w, h = input_image.size
 
                 if h % 64 != 0 or w % 64 != 0:
                     width, height = map(lambda x: x - x % 64, (w, h))
@@ -234,6 +280,7 @@ def sample(
                     uc[k] = rearrange(uc[k], "b t ... -> (b t) ...", t=num_frames)
                     c[k] = repeat(c[k], "b ... -> b t ...", t=num_frames)
                     c[k] = rearrange(c[k], "b t ... -> (b t) ...", t=num_frames)
+                uc["ref"] = c["ref"] = list(map(lambda x: x.to("cpu") if isinstance(x, torch.Tensor) else x, x_ref))
 
                 randn = torch.randn(shape, device=device)
 
@@ -249,6 +296,30 @@ def sample(
                     )
 
                 samples_z = model.sampler(denoiser, randn, cond=c, uc=uc)
+                if ref:
+                    assert len(c["ref"]) > 1
+                    assert x_ref[0]["index"] == len(c["ref"]) - 1  # num_steps * 16
+                    x_ref[0]["index"] = 0
+                    if x_ref[0]["is_ref"] is True or ref_ema:  # postprocess after the first image / after every image if ref_ema=True
+                        x_ref = c["ref"]
+                        x_ref[0]["is_ref"] = False
+                        assert (len(x_ref) - 1) % num_steps == 0
+                        if False:
+                            # except_steps = list(range(25))
+                            # except_steps = list(range(25, 50))
+                            except_steps = ()
+                            # except_levels = (4, 5, 6, 7, 8, 9)
+                            # except_levels = (0, 1, 2, 3, 10, 11, 12, 13, 14, 15)
+                            except_levels = ()
+                            num_levels = (len(x_ref) - 1) // num_steps
+                            for step in range(num_steps):
+                                for level in range(num_levels):
+                                    if step in except_steps or level in except_levels:
+                                        x_ref[1 + step * num_levels + level] = None
+                        if ref_path is not None and not os.path.isfile(ref_path):
+                            torch.save(x_ref, ref_path)
+                            print(f"Saved reference at {ref_path}.")
+
                 model.en_and_decode_n_samples_a_time = decoding_t
                 samples_x = model.decode_first_stage(samples_z)
                 if "sv3d" in version:
@@ -257,9 +328,10 @@ def sample(
 
                 os.makedirs(output_folder, exist_ok=True)
                 base_count = len(glob(os.path.join(output_folder, "*.mp4")))
+                filename = f"{base_count:06d}" if output_name is None else output_name
 
                 imageio.imwrite(
-                    os.path.join(output_folder, f"{base_count:06d}.jpg"), input_image
+                    os.path.join(output_folder, f"{filename}.jpg"), input_image
                 )
 
                 samples = embed_watermark(samples)
@@ -270,8 +342,9 @@ def sample(
                     .numpy()
                     .astype(np.uint8)
                 )
-                video_path = os.path.join(output_folder, f"{base_count:06d}.mp4")
+                video_path = os.path.join(output_folder, f"{filename}.mp4")
                 imageio.mimwrite(video_path, vid)
+                print(f"Saved video to '{os.path.abspath(video_path)}'")
 
 
 def get_unique_embedder_keys_from_conditioner(conditioner):

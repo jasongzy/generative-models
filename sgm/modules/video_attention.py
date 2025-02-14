@@ -96,7 +96,7 @@ class VideoTransformerBlock(nn.Module):
         self.switch_temporal_ca_to_sa = switch_temporal_ca_to_sa
 
         self.checkpoint = checkpoint
-        if self.checkpoint:
+        if self.checkpoint and False:
             print(f"{self.__class__.__name__} is using checkpointing")
 
     def forward(
@@ -120,10 +120,25 @@ class VideoTransformerBlock(nn.Module):
             if self.is_res:
                 x += x_skip
 
+        is_ref = True
+        strength = 0.5
+        assert 0 <= strength <= 1
+        if isinstance(context, tuple):
+            context, x_ref = context
+            assert len(x_ref) >= 1
+            is_ref = x_ref[0]
+            if is_ref:
+                x_ref.append(x.cpu())
+            else:
+                x_ref_current = x_ref.pop(1)
+                if x_ref_current is not None:
+                    x_ref_current = x_ref_current.to(x)
+                    assert x_ref_current.shape == x.shape
+
         if self.disable_self_attn:
             x = self.attn1(self.norm1(x), context=context) + x
         else:
-            x = self.attn1(self.norm1(x)) + x
+            x = self.attn1(self.norm1(x), context=None if (is_ref or x_ref_current is None) else (self.norm1(x_ref_current) * strength + self.norm1(x) * (1 - strength))) + x
 
         if self.attn2 is not None:
             if self.switch_temporal_ca_to_sa:
@@ -241,6 +256,10 @@ class SpatialVideoTransformer(SpatialTransformer):
         spatial_context = None
         if exists(context):
             spatial_context = context
+        if isinstance(context, tuple):
+            context, x_ref = context
+        else:
+            x_ref = None
 
         if self.use_spatial_context:
             assert (
@@ -256,6 +275,8 @@ class SpatialVideoTransformer(SpatialTransformer):
             time_context = repeat(time_context, "b ... -> (b n) ...", n=h * w)
             if time_context.ndim == 2:
                 time_context = rearrange(time_context, "b c -> b 1 c")
+        # if x_ref is not None:
+        #     time_context = (time_context, x_ref)
 
         x = self.norm(x)
         if not self.use_linear:
